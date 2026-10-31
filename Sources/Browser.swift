@@ -3,12 +3,13 @@ import WebKit
 import Combine
 
 @MainActor
-final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKDownloadDelegate {
+final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
     let webView: WKWebView
     @Published var address = ""
     @Published var canGoBack = false
     @Published var canGoForward = false
     @Published var loading = false
+    @Published var progress: Double = 0
     @Published var banner: String?
     private var bag = Set<AnyCancellable>()
 
@@ -20,6 +21,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKDownloa
         webView = wv
         super.init()
         wv.navigationDelegate = self
+        wv.uiDelegate = self
 
         wv.publisher(for: \.url).receive(on: DispatchQueue.main)
             .sink { [weak self] u in self?.address = u?.absoluteString ?? "" }
@@ -32,6 +34,9 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKDownloa
             .store(in: &bag)
         wv.publisher(for: \.isLoading).receive(on: DispatchQueue.main)
             .sink { [weak self] v in self?.loading = v }
+            .store(in: &bag)
+        wv.publisher(for: \.estimatedProgress).receive(on: DispatchQueue.main)
+            .sink { [weak self] v in self?.progress = v }
             .store(in: &bag)
 
         load("https://www.google.com")
@@ -64,8 +69,12 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKDownloa
                 let d = c.domain.hasPrefix(".") ? String(c.domain.dropFirst()) : c.domain
                 return host == d || host.hasSuffix("." + d)
             }
-            DownloadManager.shared.start(url: url, cookies: matching, userAgent: ua, referer: referer, name: name)
-            self.flash("Download started")
+            var headers = HTTPCookie.requestHeaderFields(with: matching)
+            if let ua { headers["User-Agent"] = ua }
+            if let referer { headers["Referer"] = referer }
+            let ok = DownloadManager.shared.add(urlString: url.absoluteString, headers: headers, name: name)
+            Haptic.success()
+            self.flash(ok ? "Download started" : "Couldn't start download")
         }
     }
 
@@ -105,6 +114,22 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKDownloa
         decisionHandler(.allow)
     }
 
+    // MARK: Links that open in a new tab (target=_blank) and pop-ups
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        guard let url = navigationAction.request.url else { return nil }
+        if navigationAction.shouldPerformDownload, url.scheme != "blob", url.scheme != "data" {
+            handOff(url, name: nil)
+            return nil
+        }
+        // Only follow real taps. Script-opened pop-ups (ads) are ignored.
+        if navigationAction.navigationType == .linkActivated {
+            webView.load(navigationAction.request)
+        }
+        return nil
+    }
+
     // MARK: Foreground fallback (blob: / data: URLs)
 
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
@@ -133,35 +158,111 @@ struct WebViewHost: UIViewRepresentable {
     func updateUIView(_ uiView: WKWebView, context: Context) {}
 }
 
-struct BrowserScreen: View {
+struct BrowserView: View {
     @ObservedObject var browser: Browser
+    @ObservedObject private var dm = DownloadManager.shared
+    @Binding var tab: AppTab
     @State private var input = ""
+    @FocusState private var editing: Bool
+
+    private var running: [DownloadRecord] { dm.records.filter { $0.status == .running } }
+    private var overall: Double {
+        let got = running.reduce(Int64(0)) { $0 + $1.received }
+        let all = running.reduce(Int64(0)) { $0 + $1.total }
+        return all > 0 ? Double(got) / Double(all) : 0
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 14) {
-                Button { browser.webView.goBack() } label: { Image(systemName: "chevron.left") }
-                    .disabled(!browser.canGoBack)
-                Button { browser.webView.goForward() } label: { Image(systemName: "chevron.right") }
-                    .disabled(!browser.canGoForward)
-                TextField("Search or enter address", text: $input)
-                    .textFieldStyle(.roundedBorder)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.webSearch)
-                    .onSubmit { browser.load(input) }
-                Button { browser.reloadOrStop() } label: {
-                    Image(systemName: browser.loading ? "xmark" : "arrow.clockwise")
+        VStack(spacing: 12) {
+            HStack(spacing: 10) {
+                Button { Haptic.tap(); browser.webView.goBack() } label: {
+                    CircleIcon(symbol: "chevron.left", tint: browser.canGoBack ? Theme.text : Theme.sub.opacity(0.5))
                 }
+                .buttonStyle(PressStyle())
+                .disabled(!browser.canGoBack)
+                .accessibilityLabel("Back")
+
+                HStack(spacing: 8) {
+                    Image(systemName: "lock.fill").font(.system(size: 12)).foregroundColor(Theme.sub)
+                    TextField("Search or enter address", text: $input)
+                        .font(.mono(13))
+                        .foregroundColor(Theme.text)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.webSearch)
+                        .submitLabel(.go)
+                        .focused($editing)
+                        .onSubmit { browser.load(input); editing = false }
+                }
+                .padding(.horizontal, 16)
+                .frame(height: 44)
+                .background(Capsule().fill(Theme.button))
+                .shadow(color: Color.black.opacity(0.08), radius: 10, x: 0, y: 4)
+
+                Button { Haptic.tap(); browser.reloadOrStop() } label: {
+                    CircleIcon(symbol: browser.loading ? "xmark" : "arrow.clockwise")
+                }
+                .buttonStyle(PressStyle())
+                .accessibilityLabel(browser.loading ? "Stop" : "Reload")
             }
-            .padding(8)
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+
             ZStack(alignment: .top) {
                 WebViewHost(webView: browser.webView)
-                if let b = browser.banner {
-                    Text(b).padding(8).background(.thinMaterial).cornerRadius(8).padding(.top, 8)
+                if browser.loading {
+                    GeometryReader { g in
+                        Capsule().fill(Theme.accent)
+                            .frame(width: g.size.width * CGFloat(browser.progress), height: 3)
+                            .animation(.easeOut(duration: 0.3), value: browser.progress)
+                    }
+                    .frame(height: 3)
+                    .transition(.opacity)
                 }
             }
+            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Theme.border, lineWidth: 1))
+            .overlay(alignment: .top) {
+                if let b = browser.banner {
+                    Text(b).font(.mono(12, .semibold)).foregroundColor(Theme.text)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(Capsule().fill(Theme.button))
+                        .shadow(color: Color.black.opacity(0.15), radius: 10, x: 0, y: 4)
+                        .padding(.top, 12)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .overlay(alignment: .bottom) {
+                if !running.isEmpty { miniPanel.padding(10).transition(.move(edge: .bottom).combined(with: .opacity)) }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 100)
         }
-        .onReceive(browser.$address) { input = $0 }
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: running.isEmpty)
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: browser.banner)
+        .animation(.easeOut(duration: 0.2), value: browser.loading)
+        .onReceive(browser.$address) { if !editing { input = $0 } }
+    }
+
+    private var miniPanel: some View {
+        Button {
+            Haptic.tap()
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) { tab = .downloads }
+        } label: {
+            VStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    Text("\(running.count) downloading").font(.mono(13, .semibold)).foregroundColor(Theme.text)
+                    Spacer(minLength: 4)
+                    Tag(text: "\(Int(overall * 100))%", kind: .red)
+                    Tag(text: Fmt.speed(dm.totalSpeed), icon: "bolt.fill", kind: .purple)
+                    Image(systemName: "chevron.up").font(.system(size: 12, weight: .bold)).foregroundColor(Theme.sub)
+                }
+                ProgressBar(value: overall)
+            }
+            .padding(12)
+            .card(22)
+            .shadow(color: Color.black.opacity(0.15), radius: 12, x: 0, y: 6)
+        }
+        .buttonStyle(PressStyle())
     }
 }
