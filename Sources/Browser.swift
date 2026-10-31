@@ -1,6 +1,8 @@
 import SwiftUI
 import WebKit
+import Combine
 
+@MainActor
 final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKDownloadDelegate {
     let webView: WKWebView
     @Published var address = ""
@@ -8,21 +10,30 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKDownloa
     @Published var canGoForward = false
     @Published var loading = false
     @Published var banner: String?
-    private var observers: [NSKeyValueObservation] = []
+    private var bag = Set<AnyCancellable>()
 
     override init() {
         let cfg = WKWebViewConfiguration()
         cfg.allowsInlineMediaPlayback = true
-        webView = WKWebView(frame: .zero, configuration: cfg)
-        webView.allowsBackForwardNavigationGestures = true
+        let wv = WKWebView(frame: .zero, configuration: cfg)
+        wv.allowsBackForwardNavigationGestures = true
+        webView = wv
         super.init()
-        webView.navigationDelegate = self
-        observers = [
-            webView.observe(\.url) { [weak self] w, _ in self?.address = w.url?.absoluteString ?? "" },
-            webView.observe(\.canGoBack) { [weak self] w, _ in self?.canGoBack = w.canGoBack },
-            webView.observe(\.canGoForward) { [weak self] w, _ in self?.canGoForward = w.canGoForward },
-            webView.observe(\.isLoading) { [weak self] w, _ in self?.loading = w.isLoading },
-        ]
+        wv.navigationDelegate = self
+
+        wv.publisher(for: \.url).receive(on: DispatchQueue.main)
+            .sink { [weak self] u in self?.address = u?.absoluteString ?? "" }
+            .store(in: &bag)
+        wv.publisher(for: \.canGoBack).receive(on: DispatchQueue.main)
+            .sink { [weak self] v in self?.canGoBack = v }
+            .store(in: &bag)
+        wv.publisher(for: \.canGoForward).receive(on: DispatchQueue.main)
+            .sink { [weak self] v in self?.canGoForward = v }
+            .store(in: &bag)
+        wv.publisher(for: \.isLoading).receive(on: DispatchQueue.main)
+            .sink { [weak self] v in self?.loading = v }
+            .store(in: &bag)
+
         load("https://www.google.com")
     }
 
@@ -36,6 +47,10 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKDownloa
             }
         }
         if let u = URL(string: t) { webView.load(URLRequest(url: u)) }
+    }
+
+    func reloadOrStop() {
+        if loading { webView.stopLoading() } else { webView.reload() }
     }
 
     // MARK: Hand downloads to the background session
@@ -56,7 +71,10 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKDownloa
 
     private func flash(_ text: String) {
         banner = text
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.banner = nil }
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            self.banner = nil
+        }
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
@@ -64,7 +82,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKDownloa
         guard let url = action.request.url else { decisionHandler(.allow); return }
         if action.shouldPerformDownload {
             if url.scheme == "blob" || url.scheme == "data" {
-                decisionHandler(.download)       // page-generated file: foreground fallback
+                decisionHandler(.download)
             } else {
                 handOff(url, name: nil)
                 decisionHandler(.cancel)
@@ -78,8 +96,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKDownloa
                  decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
         let http = response.response as? HTTPURLResponse
         let disp = http?.value(forHTTPHeaderField: "Content-Disposition")?.lowercased() ?? ""
-        if response.isForMainFrame, !response.canShowMIMEType || disp.hasPrefix("attachment"),
-           let url = response.response.url {
+        let isFile = !response.canShowMIMEType || disp.hasPrefix("attachment")
+        if response.isForMainFrame && isFile, let url = response.response.url {
             handOff(url, name: response.response.suggestedFilename)
             decisionHandler(.cancel)
             return
@@ -103,6 +121,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKDownloa
     }
 
     func downloadDidFinish(_ download: WKDownload) { flash("Saved (keep app open for these)") }
+
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
         flash("Download failed: \(error.localizedDescription)")
     }
@@ -131,9 +150,9 @@ struct BrowserScreen: View {
                     .autocorrectionDisabled()
                     .keyboardType(.webSearch)
                     .onSubmit { browser.load(input) }
-                Button {
-                    browser.loading ? browser.webView.stopLoading() : browser.webView.reload()
-                } label: { Image(systemName: browser.loading ? "xmark" : "arrow.clockwise") }
+                Button { browser.reloadOrStop() } label: {
+                    Image(systemName: browser.loading ? "xmark" : "arrow.clockwise")
+                }
             }
             .padding(8)
             ZStack(alignment: .top) {
