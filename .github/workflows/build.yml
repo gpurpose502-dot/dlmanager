@@ -6,6 +6,8 @@ on:
 jobs:
   build:
     runs-on: macos-15
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Draw app icon
@@ -30,3 +32,7 @@ jobs:
         with:
           name: DLManager-ipa
           path: DLManager.ipa
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "build-${{ github.run_number }}" DLManager.ipa --title "Build ${{ github.run_number }}" --notes "Unsigned IPA. Sign it before installing."
