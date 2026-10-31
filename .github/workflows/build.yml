@@ -8,6 +8,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Draw app icon
+        run: swift make_icon.swift Sources/Assets.xcassets/AppIcon.appiconset/icon.png
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate Xcode project
