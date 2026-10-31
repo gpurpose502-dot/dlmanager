@@ -3,6 +3,19 @@ import WebKit
 import Combine
 
 @MainActor
+final class TapHandler: NSObject, WKScriptMessageHandler {
+    var onTap: (() -> Void)?
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        onTap?()
+    }
+}
+
+private let tapScript = """
+(function(){var f=function(){try{window.webkit.messageHandlers.dlTap.postMessage(1)}catch(e){}};
+['touchstart','pointerdown','click','keydown'].forEach(function(t){window.addEventListener(t,f,true)});})();
+"""
+
+@MainActor
 final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
     let webView: WKWebView
     @Published var address = ""
@@ -12,16 +25,21 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     @Published var progress: Double = 0
     @Published var banner: String?
     private var bag = Set<AnyCancellable>()
+    private var lastTap = Date.distantPast
 
     override init() {
         let cfg = WKWebViewConfiguration()
         cfg.allowsInlineMediaPlayback = true
+        let handler = TapHandler()
+        cfg.userContentController.add(handler, name: "dlTap")
+        cfg.userContentController.addUserScript(WKUserScript(source: tapScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         let wv = WKWebView(frame: .zero, configuration: cfg)
         wv.allowsBackForwardNavigationGestures = true
         webView = wv
         super.init()
         wv.navigationDelegate = self
         wv.uiDelegate = self
+        handler.onTap = { [weak self] in self?.lastTap = Date() }
 
         wv.publisher(for: \.url).receive(on: DispatchQueue.main)
             .sink { [weak self] u in self?.address = u?.absoluteString ?? "" }
@@ -78,7 +96,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         }
     }
 
-    private func flash(_ text: String) {
+    func flash(_ text: String) {
         banner = text
         Task {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -123,8 +141,11 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
             handOff(url, name: nil)
             return nil
         }
-        // Only follow real taps. Script-opened pop-ups (ads) are ignored.
-        if navigationAction.navigationType == .linkActivated {
+        // Follow taps, and pop-ups opened right after a tap (Google Drive's Download button does this).
+        // Pop-ups with no recent tap (typical ads) are ignored.
+        let recentTap = Date().timeIntervalSince(lastTap) < 2.0
+        let isWeb = ["http", "https"].contains(url.scheme?.lowercased() ?? "")
+        if isWeb && (navigationAction.navigationType == .linkActivated || recentTap) {
             webView.load(navigationAction.request)
         }
         return nil
@@ -172,6 +193,30 @@ struct BrowserView: View {
         return all > 0 ? Double(got) / Double(all) : 0
     }
 
+    private func go(_ text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        Haptic.tap()
+        browser.load(t)
+        editing = false
+    }
+
+    private func pasteAndGo() {
+        if let s = UIPasteboard.general.string, !s.isEmpty {
+            input = s
+            go(s)
+        } else {
+            Haptic.warn()
+        }
+    }
+
+    private func copyAddress() {
+        guard !browser.address.isEmpty else { return }
+        UIPasteboard.general.string = browser.address
+        Haptic.success()
+        browser.flash("Link copied")
+    }
+
     var body: some View {
         VStack(spacing: 12) {
             HStack(spacing: 10) {
@@ -182,22 +227,7 @@ struct BrowserView: View {
                 .disabled(!browser.canGoBack)
                 .accessibilityLabel("Back")
 
-                HStack(spacing: 8) {
-                    Image(systemName: "lock.fill").font(.system(size: 12)).foregroundColor(Theme.sub)
-                    TextField("Search or enter address", text: $input)
-                        .font(.mono(13))
-                        .foregroundColor(Theme.text)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.webSearch)
-                        .submitLabel(.go)
-                        .focused($editing)
-                        .onSubmit { browser.load(input); editing = false }
-                }
-                .padding(.horizontal, 16)
-                .frame(height: 44)
-                .background(Capsule().fill(Theme.button))
-                .shadow(color: Color.black.opacity(0.08), radius: 10, x: 0, y: 4)
+                addressBar
 
                 Button { Haptic.tap(); browser.reloadOrStop() } label: {
                     CircleIcon(symbol: browser.loading ? "xmark" : "arrow.clockwise")
@@ -242,6 +272,55 @@ struct BrowserView: View {
         .animation(.spring(response: 0.4, dampingFraction: 0.85), value: browser.banner)
         .animation(.easeOut(duration: 0.2), value: browser.loading)
         .onReceive(browser.$address) { if !editing { input = $0 } }
+        .onReceive(NotificationCenter.default.publisher(for: UITextField.textDidBeginEditingNotification)) { n in
+            // Select the whole address when the bar is tapped, so typing replaces it.
+            if let tf = n.object as? UITextField, tf.placeholder == "Search or enter address" {
+                DispatchQueue.main.async { tf.selectAll(nil) }
+            }
+        }
+    }
+
+    private var addressBar: some View {
+        HStack(spacing: 2) {
+            Image(systemName: browser.address.hasPrefix("https") ? "lock.fill" : "globe")
+                .font(.system(size: 12))
+                .foregroundColor(Theme.sub)
+                .padding(.leading, 14)
+                .padding(.trailing, 6)
+            TextField("Search or enter address", text: $input)
+                .font(.mono(13))
+                .foregroundColor(Theme.text)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.webSearch)
+                .submitLabel(.go)
+                .focused($editing)
+                .onSubmit { go(input) }
+            if editing {
+                if !input.isEmpty {
+                    barButton("xmark.circle.fill", "Clear address") { Haptic.tap(); input = "" }
+                }
+                barButton("doc.on.clipboard", "Paste and go") { pasteAndGo() }
+            } else {
+                barButton("doc.on.doc", "Copy link") { copyAddress() }
+            }
+        }
+        .frame(height: 44)
+        .background(Capsule().fill(Theme.button))
+        .shadow(color: Color.black.opacity(0.08), radius: 10, x: 0, y: 4)
+        .animation(.easeOut(duration: 0.2), value: editing)
+    }
+
+    private func barButton(_ symbol: String, _ label: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(Theme.sub)
+                .frame(width: 38, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(PressStyle())
+        .accessibilityLabel(label)
     }
 
     private var miniPanel: some View {

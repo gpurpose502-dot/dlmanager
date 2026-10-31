@@ -27,12 +27,15 @@ struct QuickLookView: UIViewControllerRepresentable {
 }
 
 struct DownloadsView: View {
+    @Binding var tab: AppTab
+    @ObservedObject var browser: Browser
     @ObservedObject private var dm = DownloadManager.shared
     @AppStorage("themeMode") private var themeMode = 0
     @Environment(\.colorScheme) private var scheme
     @State private var link = ""
     @State private var shakes: CGFloat = 0
     @State private var preview: PreviewItem?
+    @State private var checking = false
     @FocusState private var focused: Bool
 
     private var todays: [DownloadRecord] {
@@ -158,7 +161,7 @@ struct DownloadsView: View {
                 .focused($focused)
                 .onSubmit(addLink)
             Button(action: addLink) {
-                Text("Download")
+                Text(checking ? "Checking…" : "Download")
                     .font(.mono(13, .semibold))
                     .foregroundColor(.white)
                     .padding(.horizontal, 16)
@@ -175,15 +178,33 @@ struct DownloadsView: View {
     }
 
     private func addLink() {
-        let t = link.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty else { return }
-        if dm.add(urlString: t) {
-            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) { link = "" }
-            focused = false
-            Haptic.success()
-        } else {
+        var t = link.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, !checking else { return }
+        if !t.contains("://") { t = "https://" + t }
+        guard let url = URL(string: t), let host = url.host, !host.isEmpty,
+              ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
             withAnimation(.linear(duration: 0.4)) { shakes += 1 }
             Haptic.warn()
+            return
+        }
+        checking = true
+        focused = false
+        Task { @MainActor in
+            let kind = await LinkProbe.check(url)
+            checking = false
+            switch kind {
+            case .file:
+                dm.add(urlString: url.absoluteString)
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) { link = "" }
+                Haptic.success()
+            case .page, .unreachable:
+                // Not a direct file: open it in the browser so the user can click through.
+                browser.load(url.absoluteString)
+                browser.flash("Opened as a web page")
+                link = ""
+                Haptic.tap()
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) { tab = .browser }
+            }
         }
     }
 

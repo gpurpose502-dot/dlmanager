@@ -21,7 +21,7 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             GridBackground()
-            DownloadsView().tabLayer(.downloads, tab)
+            DownloadsView(tab: $tab, browser: browser).tabLayer(.downloads, tab)
             BrowserView(browser: browser, tab: $tab).tabLayer(.browser, tab)
             HistoryView().tabLayer(.history, tab)
             SettingsView().tabLayer(.settings, tab)
